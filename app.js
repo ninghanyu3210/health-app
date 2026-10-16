@@ -78,6 +78,22 @@ const headers = () => ({
 const b64e = s => btoa(unescape(encodeURIComponent(s)));
 const b64d = s => decodeURIComponent(escape(atob(String(s).replace(/\s/g, ''))));
 
+/* 带超时的 fetch：网络被卡住时必须报错，不能永远停在"同步中" */
+async function fetchT(url, opt = {}, ms = 15000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, { ...opt, signal: ac.signal });
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message)))) {
+      throw new Error(`请求超时（${ms / 1000} 秒无响应）— 网络到 GitHub 不通`);
+    }
+    throw new Error('连不上 GitHub（网络被阻断或断网）');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function setStatus(kind, text) {
   const d = $('#statusDot');
   d.className = 'dot ' + (kind || '');
@@ -87,7 +103,8 @@ function setStatus(kind, text) {
 
 async function pull() {
   if (!configured()) throw new Error('未配置 GitHub');
-  const r = await fetch(`${api()}?ref=${encodeURIComponent(cfg.branch)}&t=${Date.now()}`, { headers: headers(), cache: 'no-store' });
+  const url = `${api()}?ref=${encodeURIComponent(cfg.branch)}&t=${Date.now()}`;
+  const r = await fetchT(url, { headers: headers(), cache: 'no-store' });
   if (r.status === 404) return { fresh: true };
   if (!r.ok) throw new Error(`读取失败 HTTP ${r.status}${r.status === 401 ? '（令牌无效或已过期）' : r.status === 403 ? '（令牌权限不足或超限）' : ''}`);
   const j = await r.json();
@@ -106,12 +123,21 @@ async function push(snapshot, msg) {
     branch: cfg.branch
   };
   if (meta.sha) body.sha = meta.sha;
-  const r = await fetch(api(), { method: 'PUT', headers: { ...headers(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await fetchT(api(), {
+    method: 'PUT',
+    headers: { ...headers(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }, 20000);
   if (r.status === 409) throw new Error('__CONFLICT__');
   if (!r.ok) {
     let d = '';
     try { d = (await r.json()).message || ''; } catch {}
-    throw new Error(`写入失败 HTTP ${r.status}${d ? '：' + d : ''}`);
+    const hint = r.status === 401 ? '（令牌无效或已过期）'
+      : r.status === 403 ? '（令牌权限不足，检查 Contents 是否为 Read and write）'
+      : r.status === 404 ? '（仓库名/用户名不对，或令牌没勾选这个仓库）'
+      : r.status === 422 ? `（分支 ${cfg.branch} 不存在 —— 你的仓库可能是 master）`
+      : '';
+    throw new Error(`写入失败 HTTP ${r.status}${hint}${d ? '｜' + d : ''}`);
   }
   const j = await r.json();
   meta.sha = j.content && j.content.sha;
@@ -148,6 +174,75 @@ function removeRecord(kind, id) {
 }
 
 let syncing = false;
+
+/* 网络诊断：逐项测通，把结果打在设置页上（不含令牌，可以截图发人） */
+let diagLog = [];
+async function diagnose() {
+  diagLog = [];
+  const say = s => { diagLog.push(s); if (state.tab === 'settings') render(); };
+  diagLog.push('— 网络诊断 ' + new Date().toLocaleTimeString('zh-CN') + ' —');
+
+  // 1. 能不能上网
+  say('1) 判断设备是否在线…');
+  if (!navigator.onLine) { say('   ❌ 设备处于离线状态'); return; }
+  say('   ✅ 设备报告在线');
+
+  // 2. 能不能到 GitHub API
+  say('2) 测试连接 api.github.com…');
+  const t0 = Date.now();
+  try {
+    const r = await fetchT('https://api.github.com/rate_limit', { headers: { 'Accept': 'application/vnd.github+json' } }, 12000);
+    say(`   ✅ 通了（HTTP ${r.status}，${Date.now() - t0} ms）`);
+  } catch (e) {
+    say('   ❌ ' + e.message);
+    say('   → 这就是同步卡住的原因：网络到 GitHub 不通');
+    say('   → 换 WiFi / 切蜂窝数据 / 检查代理或 VPN 后再试');
+    return;
+  }
+
+  // 3. 令牌能不能用
+  if (!configured()) { say('3) 跳过：还没填 GitHub 配置'); return; }
+  say('3) 测试令牌是否有效…');
+  try {
+    const r = await fetchT('https://api.github.com/user', { headers: headers() }, 12000);
+    if (r.status === 200) {
+      const u = await r.json();
+      say(`   ✅ 令牌有效，登录身份：${u.login}`);
+    } else {
+      say(`   ❌ HTTP ${r.status}${r.status === 401 ? ' — 令牌无效/已过期' : ''}`);
+      return;
+    }
+  } catch (e) { say('   ❌ ' + e.message); return; }
+
+  // 4. 仓库和分支能不能访问
+  say(`4) 测试仓库 ${cfg.owner}/${cfg.repo}（分支 ${cfg.branch}）…`);
+  try {
+    const r = await fetchT(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}`, { headers: headers() }, 12000);
+    if (r.status === 200) {
+      const j = await r.json();
+      say(`   ✅ 仓库可访问（可见性：${j.private ? '私有' : '公开'}，默认分支：${j.default_branch}）`);
+      if (j.private !== true) say('   ⚠️ 这个仓库是公开的！健康数据不应该放公开仓库');
+      if (j.default_branch !== cfg.branch) say(`   ⚠️ 分支填的是 ${cfg.branch}，但仓库默认分支是 ${j.default_branch} → 把设置里分支改成 ${j.default_branch}`);
+    } else if (r.status === 404) {
+      say('   ❌ HTTP 404 — 仓库名/用户名写错，或令牌没勾选这个仓库');
+      return;
+    } else {
+      say(`   ❌ HTTP ${r.status}`);
+      return;
+    }
+  } catch (e) { say('   ❌ ' + e.message); return; }
+
+  // 5. 直接试读数据文件
+  say('5) 尝试读取 data/health.json…');
+  try {
+    const { remote, fresh } = await pull();
+    if (fresh) say('   文件还不存在（首次同步会创建它）');
+    else say(`   已存在，含 ${(remote.daily || []).length + (remote.meals || []).length} 条记录`);
+  } catch (e) { say('   ❌ ' + e.message); return; }
+
+  say('诊断结束。以上全部 ✅ 的话，同步应该能成功。');
+}
+
 async function sync(manual) {
   if (syncing) return;
   if (!configured()) { if (manual) openSettings(); return; }
@@ -839,8 +934,17 @@ function renderSettings(v) {
   const b2 = el('div', 'actions');
   const nowBtn = el('button', 'btn sec', '立即同步');
   nowBtn.onclick = () => sync(true);
-  b2.appendChild(nowBtn);
+  const diagBtn = el('button', 'btn sec', '网络诊断');
+  diagBtn.onclick = diagnose;
+  b2.append(nowBtn, diagBtn);
   st.appendChild(b2);
+  if (diagLog.length) {
+    const pre = el('div', 'faint');
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.style.marginTop = '10px';
+    pre.textContent = diagLog.join('\n');
+    st.appendChild(pre);
+  }
   v.appendChild(st);
 
   /* 数据管理 */
