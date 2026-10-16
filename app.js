@@ -24,6 +24,8 @@ const BASE = {
   veg:     { lo: null, hi: null, unit: '次',  label: '蔬菜',     dec: 0 }
 };
 const SUGARY = ['可乐','雪碧','奶茶','果汁','含糖','甜饮料','碳酸','啤酒'];
+/* 基础代谢粗估（仅用于"摄入 vs 消耗"的粗略对比，不是精确值；可在设置里改） */
+let BASAL_KCAL = (load(K.cfg, {}).basal) || 1500;
 const TAGS = ['蔬菜','水果','蛋类','乳制品','全谷','禽肉','红肉','鱼虾','豆制品','油炸','外卖','夜宵'];
 
 /* ============ 工具 ============ */
@@ -340,6 +342,24 @@ function mealStats() {
     late: rows.filter(r => String(r.time || '') >= '21:00' || String(r.meal || '') === '夜宵').length
   };
 }
+/* 摄入 vs 消耗（都只是粗略估计，用于看趋势，不是精确能量学） */
+function consumption() {
+  const days = inWindow(data.daily, daysAgo(6), todayStr());
+  const sum = k => days.reduce((s, r) => s + (typeof r[k] === 'number' ? r[k] : 0), 0);
+  const n = days.filter(r => typeof r.active_kcal === 'number').length;
+  const active = sum('active_kcal');
+  const basal = BASAL_KCAL * n;              // 基础代谢粗估
+  return { active, basal, total: active + basal, days: n };
+}
+function mealKcal() {
+  const rows = inWindow(data.meals, daysAgo(6), todayStr());
+  const withK = rows.filter(r => typeof r.kcal === 'number' && r.kcal > 0);
+  const total = withK.reduce((s, r) => s + r.kcal, 0);
+  const days = new Set(rows.map(r => dOnly(r.date))).size || 1;
+  const coveredDays = new Set(withK.map(r => dOnly(r.date))).size;
+  return { total, days, filled: withK.length, all: rows.length, coveredDays, avg: days ? total / days : null };
+}
+
 function streak() {
   let n = 0;
   for (let i = 0; i < 400; i++) {
@@ -497,9 +517,16 @@ function renderTrend(v) {
   sl.append(el('span', 'val', String(spw)), el('span', 'unit', '天/周'));
   sh.append(sl, el('span', spw >= 2 ? 'pill ok' : 'pill warn', spw >= 2 ? '达标' : '不达标'));
   sc.appendChild(sh);
-  sc.appendChild(el('div', 'cmp', `WHO 建议每周 ≥2 天力量训练　本期共 ${fmt(exerciseMinutes(), 0)} 分钟运动`));
+  const exRows = inWindow(data.exercises, daysAgo(6), todayStr());
+  const exMin = exRows.reduce((s, r) => s + (num(r.minutes) || 0), 0);
+  const exKcal = exRows.reduce((s, r) => s + (num(r.kcal) || 0), 0);
+  const exKcalN = exRows.filter(r => typeof r.kcal === 'number').length;
+  sc.appendChild(el('div', 'cmp',
+    `WHO 建议每周 ≥2 天力量训练　本期 ${exRows.length} 次，共 ${fmt(exMin, 0)} 分钟` +
+    (exKcal ? `，运动消耗 ${fmt(exKcal, 0)} kcal` : '') +
+    (exRows.length && exKcalN < exRows.length ? `（${exRows.length - exKcalN} 次没填消耗）` : '')));
   if (!data.exercises.length) {
-    const n = el('div', 'spark-empty', '运动补记是空的 —— 手环只告诉消耗，看不出练了什么');
+    const n = el('div', 'spark-empty', '运动补记是空的 —— 手环只告诉总消耗，看不出你练了什么');
     sc.appendChild(n);
   }
   v.appendChild(sc);
@@ -535,6 +562,40 @@ function renderTrend(v) {
   }
   v.appendChild(mc);
 
+  /* 摄入 vs 消耗 */
+  const mk = mealKcal();
+  const cs = consumption();
+  v.appendChild(el('h2', 'sec', '摄入 vs 消耗（最近 7 天）'));
+  const ec = el('div', 'tcard');
+  if (!mk.filled) {
+    ec.appendChild(el('div', 'cmp', '还没有填过估算热量。记一餐时填个大概数字（可留空），这里就能看能量收支。'));
+  } else {
+    const daysUsed = Math.max(1, mk.coveredDays);
+    const inPerDay = mk.total / daysUsed;
+    const outPerDay = cs.days ? cs.total / cs.days : null;
+    ec.appendChild(el('div', 'cmp',
+      `已填 ${mk.filled}/${mk.all} 餐 · 覆盖 ${mk.coveredDays} 天` +
+      (mk.coveredDays < mk.days ? `（有 ${mk.days - mk.coveredDays} 天没填热量，日均按已填的天数算）` : '')));
+    const t = el('div');
+    t.append(
+      (() => { const n = el('div', 'kv'); n.append(el('span', null, '日均摄入'), el('span', null, Math.round(inPerDay) + ' kcal')); return n; })(),
+      (() => { const n = el('div', 'kv'); n.append(el('span', null, '日均消耗（基础+活动粗估）'), el('span', null, outPerDay == null ? '—' : Math.round(outPerDay) + ' kcal')); return n; })()
+    );
+    if (outPerDay != null) {
+      const bal = inPerDay - outPerDay;
+      const nb = el('div', 'kv');
+      const label = el('span', null, '收支');
+      const val = el('span', null, (bal > 0 ? '盈余 +' : '缺口 ') + Math.round(bal) + ' kcal/天');
+      val.style.color = bal > 0 ? 'var(--warn)' : 'var(--acc)';
+      nb.append(label, val);
+      t.appendChild(nb);
+    }
+    ec.appendChild(t);
+    ec.appendChild(el('div', 'faint',
+      `消耗里含基础代谢粗估 ${BASAL_KCAL} kcal/天。两个数字都是估计值，只用来判断"在盈余还是在缺口"，不要当精确值。`));
+  }
+  v.appendChild(ec);
+
   /* 记录连续性 */
   v.appendChild(el('h2', 'sec', '记录情况'));
   const dc = el('div', 'tcard');
@@ -556,8 +617,14 @@ function itemEl(r) {
   const it = el('div', 'item');
   const t = el('div', 't', r._k === 'meal' ? (r.time || '') : (r.time || ''));
   let main, kind = '';
-  if (r._k === 'meal') { main = r.text; kind = r.meal || ''; }
-  else if (r._k === 'ex') { main = r.kind + (r.minutes ? ` ${r.minutes} 分钟` : ''); kind = '运动'; }
+  if (r._k === 'meal') {
+    main = r.text + (typeof r.kcal === 'number' ? `　≈${r.kcal} kcal` : '');
+    kind = r.meal || '';
+  }
+  else if (r._k === 'ex') {
+    main = r.kind + (r.minutes ? ` ${r.minutes} 分钟` : '') + (typeof r.kcal === 'number' ? `　${r.kcal} kcal` : '');
+    kind = '运动';
+  }
   else { main = r.text; kind = r.type || ''; }
   const m = el('div', 'm', esc(main));
   const k = el('div', 'k', kind);
@@ -630,6 +697,33 @@ function renderLog(v) {
   });
 }
 
+/* ============ 从网址参数接收数据（给 iOS 快捷指令用） ============
+   例: ?sleep=7.5&kcal=620&steps=9200&weight=71.5
+   支持逗号分隔多个值，自动取平均（处理一天多段睡眠/多次称重）
+   缺的字段留空，不覆盖已有数据
+*/
+function parseStats() {
+  const q = new URLSearchParams(location.search);
+  const take = (...keys) => {
+    for (const k of keys) {
+      const v = q.get(k);
+      if (v == null || v === '') continue;
+      const nums = String(v).split(',').map(x => parseFloat(x.trim())).filter(x => Number.isFinite(x));
+      if (nums.length === 1) return nums[0];
+      if (nums.length > 1) return nums.reduce((a, b) => a + b, 0) / nums.length;
+    }
+    return null;
+  };
+  const round = (v, n) => v == null ? null : Math.round(v * 10 ** n) / 10 ** n;
+  return {
+    sleep_h: round(take('sleep', 'sleep_h'), 2),
+    active_kcal: round(take('kcal', 'active', 'active_kcal'), 0),
+    steps: round(take('steps'), 0),
+    weight_kg: round(take('weight', 'weight_kg'), 1),
+    resting_hr: round(take('hr', 'resting_hr'), 0)
+  };
+}
+
 /* ============ 抽屉表单 ============ */
 function openSheet(title, build) {
   $('#sheetTitle').textContent = title;
@@ -692,10 +786,32 @@ function actions(parent, onSave, onDelete) {
 }
 
 /* --- 每日指标 --- */
-function formDaily(existing) {
-  const t = todayStr();
-  const rec = existing || data.daily.find(r => dOnly(r.date) === t) || { date: t };
-  openSheet(existing ? '编辑指标' : '今日指标', f => {
+function formDaily(existing, pre = {}, dateStr = todayStr()) {
+  const t = dateStr;
+  const existingToday = data.daily.find(r => dOnly(r.date) === t);
+  const base = existing || existingToday || { date: t };
+  // 预填只补空缺，绝不覆盖已有值（避免快捷指令把你自己填的数据冲掉）
+  const rec = { ...base };
+  const ignored = [];
+  for (const k of ['sleep_h', 'active_kcal', 'weight_kg', 'steps', 'resting_hr']) {
+    if (pre[k] == null) continue;
+    if (rec[k] == null) rec[k] = pre[k];
+    else ignored.push(k);
+  }
+  const fromShortcut = Object.keys(pre).some(k => pre[k] != null);
+  openSheet(existing ? '编辑指标' : (fromShortcut ? '快捷指令读数 · 请确认' : '今日指标'), f => {
+    if (fromShortcut) {
+      const tip = el('div', 'warnbox');
+      let msg = '以下数字来自「健康」App，是快捷指令自动读的。核对后保存，读错可以直接改。';
+      if (ignored.length) {
+        const names = { sleep_h: '睡眠', active_kcal: '活动消耗', weight_kg: '体重', steps: '步数', resting_hr: '静息心率' };
+        msg += '\n注意：' + ignored.map(k => names[k] || k).join('、') +
+               '这项你已经填过了，自动读到的值没有覆盖它（保留你自己填的）。想改用新值请手动改。';
+      }
+      tip.style.whiteSpace = 'pre-line';
+      tip.textContent = msg;
+      f.appendChild(tip);
+    }
     field(f, '日期', { name: 'date', type: 'date', value: dOnly(rec.date) || t, required: true });
     const row1 = el('div', 'f2');
     f.appendChild(row1);
@@ -755,6 +871,15 @@ function formMeal() {
     wrap.appendChild(chips);
     f.appendChild(wrap);
     field(f, '吃了什么', { name: 'text', type: 'textarea', placeholder: '食堂：米饭、青菜、鸡腿', required: true, hint: '不用算热量，说人话就行' });
+    field(f, '估算热量 kcal', {
+      name: 'kcal', type: 'number', inputmode: 'numeric', placeholder: '600（可留空）',
+      hint: '自己粗估就行'
+    });
+    const ref = el('div', 'faint');
+    ref.style.marginTop = '-4px';
+    ref.style.marginBottom = '12px';
+    ref.textContent = '粗估参考：一碗米饭 200｜一拳头米饭 150｜一个鸡腿 180｜一个鸡蛋 70｜一杯牛奶 150｜一勺炒菜油 90';
+    f.appendChild(ref);
     const tw = el('div', 'f');
     tw.appendChild(el('label', null, '标签（可点选，也可不选）'));
     const tc = el('div', 'chips');
@@ -780,6 +905,7 @@ function formMeal() {
     data.meals.push({
       id: uid(), date: g('date') || todayStr(), time: g('time') || nowTime(),
       meal: form._getMeal(), text,
+      kcal: num(g('kcal')),
       tags: form._getTags(),
       sugary: SUGARY.some(s => blob.includes(s)),
       src: 'app'
@@ -809,6 +935,10 @@ function formExercise() {
       chips.appendChild(c);
     });
     wrap.appendChild(chips); f.appendChild(wrap);
+    field(f, '运动消耗 kcal', {
+      name: 'kcal', type: 'number', inputmode: 'numeric', placeholder: '320（可留空）',
+      hint: 'iWatch：健身记录里那次的"活动能量"'
+    });
     field(f, '备注', { name: 'note', type: 'textarea', placeholder: '练了哪些动作、强度…（可留空）' });
     actions(f, null, null);
     f._getKind = () => kind;
@@ -819,7 +949,8 @@ function formExercise() {
     const g = n => { const x = $('[name="' + n + '"]', form); return x ? x.value.trim() : ''; };
     data.exercises.push({
       id: uid(), date: g('date') || todayStr(), time: nowTime(),
-      kind: form._getKind(), minutes: num(g('minutes')), note: g('note'), src: 'app'
+      kind: form._getKind(), minutes: num(g('minutes')), kcal: num(g('kcal')),
+      note: g('note'), src: 'app'
     });
     persist(); enqueue(); closeSheet(); render();
     toast('已记录');
@@ -905,10 +1036,19 @@ function renderSettings(v) {
   mk('仓库名', 'repo', '例如 my-health');
   mk('分支', 'branch', 'main');
   mk('访问令牌 (Token)', 'token', 'github_pat_…', 'password');
+  const bw = el('div', 'set');
+  bw.appendChild(el('label', null, '基础代谢粗估 kcal/天'));
+  const bi = el('input');
+  bi.type = 'number'; bi.inputMode = 'numeric'; bi.placeholder = '1500'; bi.value = BASAL_KCAL;
+  bi.oninput = () => { const v = parseFloat(bi.value); if (Number.isFinite(v) && v > 0) BASAL_KCAL = v; };
+  bw.appendChild(bi);
+  bw.appendChild(el('div', 'faint', '只用于"摄入 vs 消耗"的粗略对比。不知道就按 1500 留着，或问医生/体脂秤给的数值。'));
+  card.appendChild(bw);
 
   const btnRow = el('div', 'actions');
   const saveBtn = el('button', 'btn', '保存并同步');
   saveBtn.onclick = async () => {
+    cfg.basal = BASAL_KCAL;          // 基础代谢一并存进配置
     save(K.cfg, cfg);
     if (!configured()) { toast('三项都要填'); return; }
     toast('正在测试连接…');
@@ -1014,16 +1154,16 @@ function seedDemo() {
       resting_hr: 59 + (k % 5), note: sleep < 6 ? '熬夜' : '', src: 'demo'
     });
     const bad = k % 3 === 0;
-    meals.push({ id: 'demo-m' + i + 'a', date: d, time: '08:10', meal: '早餐', text: BREAK[k % 3], tags: [], sugary: false });
-    meals.push({ id: 'demo-m' + i + 'b', date: d, time: '12:30', meal: '午餐', text: LUNCH[k % 4], tags: [], sugary: k % 4 === 2 });
+    meals.push({ id: 'demo-m' + i + 'a', date: d, time: '08:10', meal: '早餐', text: BREAK[k % 3], kcal: [420, 380, 460][k % 3], tags: [], sugary: false });
+    meals.push({ id: 'demo-m' + i + 'b', date: d, time: '12:30', meal: '午餐', text: LUNCH[k % 4], kcal: [650, 520, 880, 600][k % 4], tags: [], sugary: k % 4 === 2 });
     if (k % 4 === 0) {
-      meals.push({ id: 'demo-m' + i + 'c', date: d, time: '19:00', meal: '晚餐', text: DINNER[2], tags: [], sugary: false });
-      meals.push({ id: 'demo-m' + i + 'd', date: d, time: '22:20', meal: '夜宵', text: '泡面、可乐', tags: [], sugary: true });
+      meals.push({ id: 'demo-m' + i + 'c', date: d, time: '19:00', meal: '晚餐', text: DINNER[2], kcal: 900, tags: [], sugary: false });
+      meals.push({ id: 'demo-m' + i + 'd', date: d, time: '22:20', meal: '夜宵', text: '泡面、可乐', kcal: 550, tags: [], sugary: true });
     } else {
-      meals.push({ id: 'demo-m' + i + 'c', date: d, time: '19:00', meal: '晚餐', text: DINNER[k % 4], tags: [], sugary: false });
+      meals.push({ id: 'demo-m' + i + 'c', date: d, time: '19:00', meal: '晚餐', text: DINNER[k % 4], kcal: [560, 480, 940, 430][k % 4], tags: [], sugary: false });
     }
-    if (k % 3 === 0) exercises.push({ id: 'demo-x' + i, date: d, time: '19:30', kind: '力量训练', minutes: 40, note: '', src: 'demo' });
-    else if (k % 2 === 0) exercises.push({ id: 'demo-x' + i, date: d, time: '07:00', kind: '跑步', minutes: 30, note: '', src: 'demo' });
+    if (k % 3 === 0) exercises.push({ id: 'demo-x' + i, date: d, time: '19:30', kind: '力量训练', minutes: 40, kcal: 260, note: '', src: 'demo' });
+    else if (k % 2 === 0) exercises.push({ id: 'demo-x' + i, date: d, time: '07:00', kind: '跑步', minutes: 30, kcal: 330, note: '', src: 'demo' });
     if (k % 8 === 0) events.push({ id: 'demo-e' + i, date: d, time: '08:00', type: '用药', text: '维生素D 1粒', src: 'demo' });
     if (k === 12) events.push({ id: 'demo-e-sick', date: d, time: '09:00', type: '生病', text: '感冒，低烧一天', src: 'demo' });
   }
@@ -1041,14 +1181,25 @@ window.addEventListener('online',  () => { online = true;  renderBanner(); if (c
 window.addEventListener('offline', () => { online = false; renderBanner(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden && configured()) sync(false); });
 
+/* 快捷指令送来的数据 → 打开表单等用户确认 */
+function fromShortcut() {
+  const s = parseStats();
+  if (!Object.values(s).some(v => v != null)) return false;
+  const dateStr = new URLSearchParams(location.search).get('date') || todayStr();
+  formDaily(null, s, dateStr);
+  return true;
+}
+
 /* ============ 启动 ============ */
+setStatus(configured() ? (online ? 'ok' : 'off') : 'off');
 if (location.search.includes('demo=1')) {
   // 演示模式：只在没有真实数据时生成，避免覆盖用户已填的东西
   if (recCount() === 0) seedDemo();
   state.tab = 'trend';
+  render();
+} else if (!fromShortcut()) {
+  render();
 }
-setStatus(configured() ? (online ? 'ok' : 'off') : 'off');
-render();
 if (configured()) sync(false);
 
 })();
