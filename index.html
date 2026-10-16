@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1220">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="健康记录">
+<title>健康记录</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="statusDot"></span>
+      <span id="brandText">健康记录</span>
+    </div>
+    <button class="btn-ghost" id="syncBtn" title="立即同步">同步</button>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <main id="view"></main>
+
+  <nav class="tabbar" id="tabbar">
+    <button data-tab="today"    class="tab active"><i>✎</i><span>记录</span></button>
+    <button data-tab="trend"    class="tab"><i>◔</i><span>趋势</span></button>
+    <button data-tab="log"      class="tab"><i>☰</i><span>明细</span></button>
+    <button data-tab="settings" class="tab"><i>⚙</i><span>设置</span></button>
+  </nav>
+
+</div>
+
+<div class="sheet-wrap" id="sheetWrap" hidden>
+  <div class="sheet-mask" id="sheetMask"></div>
+  <section class="sheet" id="sheet" role="dialog" aria-modal="true">
+    <div class="sheet-head">
+      <h2 id="sheetTitle">记录</h2>
+      <button class="btn-ghost" id="sheetClose" aria-label="关闭">✕</button>
+    </div>
+    <form id="sheetForm" class="sheet-body" novalidate></form>
+  </section>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+<script>
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
+  }
+</script>
+</body>
+</html>
